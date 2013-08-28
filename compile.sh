@@ -5,6 +5,7 @@ PROGVER=0.1.0
 PROGNAME=${0##*/}
 WORKDIR=${PWD}
 PREFIX="/usr/local"
+CPU_CORES=$(grep processor /proc/cpuinfo | wc -l)
 
 usage() {
     cat << EOF
@@ -44,6 +45,15 @@ EOF
  --lighttpd-post-install & configure lighttpd
 EOF
     echo; cat << EOF | column -s\& -t
+ --nginx & compile and install nginx
+ --nginx-version & specify nginx version, default is the latest
+ --nginx-user & specify nginx user
+ --nginx-fetch & perform fetch and unpack source
+ --nginx-compile & compile source
+ --nginx-install & install files
+ --nginx-post-install & configure nginx
+EOF
+    echo; cat << EOF | column -s\& -t
  -h, --help & show this output
  --version & show version information
 EOF
@@ -54,7 +64,7 @@ user_add() {
     getent passwd | grep -q "^${USR}:"
     if [ $? -ne 0 ]; then
         groupadd -r ${USR}
-        useradd -r -g ${USR} ${USR}
+        useradd -r -g -M ${USR} ${USR}
     fi
 }
 
@@ -99,6 +109,7 @@ socket=${SOCKET}
 
 server-id=${ID}
 log-bin=mysql-bin
+report-host=$(hostname)
 skip_name_resolve
 innodb_file_per_table
 max_connections=1024
@@ -158,7 +169,7 @@ mysql_compile() {
         -DCURSES_INCLUDE_PATH=/usr/include \
         -DCURSES_LIBRARY=/usr/lib64/libncurses.so \
         -DCMAKE_INSTALL_PREFIX=${PREFIX}/mysql-${VERSION}
-    make -j `grep processor /proc/cpuinfo | wc -l` || return 1
+    make -j ${CPU_CORES} || return 1
     return 0
 }
 
@@ -197,6 +208,7 @@ mysql_post_install() {
     if [ ${RUN} != 0 ]; then
         if [ ${EXIST} != 0 ]; then
             cp -f ./support-files/mysql.server /etc/init.d/mysql.server
+
             chmod 755 /etc/init.d/mysql.server
             chkconfig --add /etc/init.d/mysql.server
             chkconfig mysql.server on
@@ -222,7 +234,7 @@ mysql_post_install() {
             printf "\nmysql database already exists\n"
         fi
     else
-        printf "\nmysql server is already running\n"
+        printf "\nmysql server is already running, skipping post-install\n"
     fi
 
     if [ ! -f "/etc/profile.d/mysql.sh" ]; then
@@ -336,7 +348,7 @@ php_compile() {
         --enable-sockets"
 
     ./configure ${CONFIGURE}
-    make -j `grep processor /proc/cpuinfo | wc -l` || return 1
+    make -j ${CPU_CORES} || return 1
     return 0
 }
 
@@ -403,19 +415,20 @@ php_post_install() {
             cp -f ${WORKDIR}/php-${VERSION}/sapi/fpm/init.d.php-fpm /etc/init.d/php-fpm
             cp -f ${PREFIX}/php-${VERSION}/etc/php-fpm.conf.default ${PREFIX}/php-${VERSION}/etc/php-fpm.conf
 
-            [ -L ${PREFIX}/php ] && rm -f ${PREFIX}/php
-            ln -sf ${PREFIX}/php-${VERSION} ${PREFIX}/php
-
-            php_default_config
-
-            mkdir -p /var/www
             chmod 755 /etc/init.d/php-fpm
             chkconfig --add /etc/init.d/php-fpm
             chkconfig php-fpm on
+
+            [ -L ${PREFIX}/php ] && rm -f ${PREFIX}/php
+            ln -sf ${PREFIX}/php-${VERSION} ${PREFIX}/php
+
+            mkdir -p /var/www
+            php_default_config
+
             printf "starting php-fpm\n"
             /etc/init.d/php-fpm start || return 1
         else
-            printf "php-fpm is already running\n"
+            printf "php-fpm is already running, skipping post-install\n"
         fi
     else
         cp -f ${PHP_INI} ${PREFIX}/php-${VERSION}/lib/
@@ -443,15 +456,6 @@ lighttpd_prepare() {
     FILENAME="lighttpd-${VERSION}.tar.gz"
     if [ -z ${LIGHTTPD_USER} ]; then
         LIGHTTPD_USER="daemon"
-    fi
-
-    CONFIGURE="
-        --prefix=${PREFIX}/lighttpd-${VERSION} \
-        --with-openssl"
-
-    grep -q "^${PREFIX}" `which mysql 2>/dev/null`
-    if [ $? -eq 0 ]; then
-        CONFIGURE="${CONFIGURE} --with-mysql=${PREFIX}/mysql/bin/mysql_config"
     fi
 
     MAJOR_VERSION=`echo ${VERSION} | awk -F \. {'print $1"."$2'}`
@@ -491,8 +495,17 @@ lighttpd_compile() {
     PACKAGES="openssl-devel pcre-devel bzip2-devel"
     yum -y install ${PACKAGES}
 
+    CONFIGURE="
+        --prefix=${PREFIX}/lighttpd-${VERSION} \
+        --with-openssl"
+
+    grep -q "^${PREFIX}" `which mysql 2>/dev/null`
+    if [ $? -eq 0 ]; then
+        CONFIGURE="${CONFIGURE} --with-mysql=${PREFIX}/mysql/bin/mysql_config"
+    fi
+
     ./configure ${CONFIGURE}
-    make -j `grep processor /proc/cpuinfo | wc -l` || return 1
+    make -j ${CPU_CORES} || return 1
     return 0
 }
 
@@ -632,11 +645,16 @@ EOF
 }
 
 lighttpd_post_install() {
+    cd ${PREFIX}/php-${VERSION} || return 1
     if [ ${RUN} -ne 0 ]; then
         cp -f ${WORKDIR}/lighttpd-${VERSION}/doc/initscripts/rc.lighttpd.redhat /etc/init.d/lighttpd
         echo "LIGHTTPD_CONF_PATH=${PREFIX}/lighttpd/etc/lighttpd.conf" > /etc/sysconfig/lighttpd
         sed -i '/^lighttpd=/c\lighttpd=/usr/local/lighttpd/sbin/lighttpd' /etc/init.d/lighttpd
         sed -i '/^lighttpd=/a\\nulimit -n 65535' /etc/init.d/lighttpd
+
+        chmod 755 /etc/init.d/lighttpd
+        chkconfig --add /etc/init.d/lighttpd
+        chkconfig lighttpd on
 
         mkdir -p ${PREFIX}/lighttpd-${VERSION}/etc /var/log/lighttpd /var/www/htdocs /var/cache/lighttpd/compress
         chown ${LIGHTTPD_USER}: /var/log/lighttpd /var/cache/lighttpd/compress
@@ -651,13 +669,171 @@ lighttpd_post_install() {
         [ -L ${PREFIX}/lighttpd ] && rm -f ${PREFIX}/lighttpd
         ln -sf ${PREFIX}/lighttpd-${VERSION} ${PREFIX}/lighttpd
 
-        chmod 755 /etc/init.d/lighttpd
-        chkconfig --add /etc/init.d/lighttpd
-        chkconfig lighttpd on
         printf "starting lighttpd\n"
         /etc/init.d/lighttpd start || return 1
     else
-        printf "lighttpd is already running\n"
+        printf "lighttpd is already running, skipping post-install\n"
+    fi
+    return 0
+}
+
+###################
+#####  Nginx  #####
+###################
+
+nginx_prepare() {
+    nginx_get_version $1
+
+    FILENAME="nginx-${VERSION}.tar.gz"
+    if [ -z ${NGINX_USER} ]; then
+        NGINX_USER="daemon"
+    fi
+
+    MAJOR_VERSION=`echo ${VERSION} | awk -F \. {'print $1"."$2'}`
+
+    ps aux | grep -q "${PREFIX}/[n]ginx"
+    RUN=$?
+    test -f ${PREFIX}/nginx/conf/nginx.conf
+    EXIST=$?
+}
+
+nginx_get_version() {
+    if [ -z "$1" ]; then
+        if [ -z "${VERSION}" ]; then
+            which tidy >/dev/null 2>&1 || yum -y install tidy
+            VERSION=`curl -s http://nginx.org/en/download.html | tidy -q 2>/dev/null | \
+                grep '^"/download' | head -n 3 | tail -n 1 | \
+                awk -F'>' '{print $2}' | sed 's/nginx-\(.*\)<.*/\1/'`
+        fi
+    else
+        VERSION=$1
+    fi
+}
+
+nginx_fetch() {
+    mkdir -p ${WORKDIR} && cd ${WORKDIR}
+    if [ ! -f ${WORKDIR}/${FILENAME} ]; then
+        wget http://nginx.org/download/${FILENAME} || return 1
+    fi
+    if [ -d ${WORKDIR}/nginx-${VERSION} ]; then
+        rm -rf ${WORKDIR}/nginx-${VERSION}
+    fi
+    tar -xvpf ${FILENAME}
+    return 0
+}
+
+nginx_compile() {
+    cd ${WORKDIR}/nginx-${VERSION} || return 1
+
+    PACKAGES="openssl-devel pcre-devel zlib-devel"
+    yum -y install ${PACKAGES}
+
+    CONFIGURE="
+        --user=${NGINX_USER} \
+        --group=${NGINX_USER} \
+        --prefix=${PREFIX}/nginx-${VERSION} \
+        --pid-path=/var/run/nginx.pid \
+        --lock-path=/var/lock/nginx.lock \
+        --with-http_ssl_module \
+        --with-http_gunzip_module \
+        --with-http_gzip_static_module \
+        --with-http_stub_status_module \
+		--http-client-body-temp-path=/client \
+		--http-proxy-temp-path=/var/tmp/nginx/proxy \
+		--http-fastcgi-temp-path=/var/tmp/nginx/fastcgi \
+		--http-scgi-temp-path=/var/tmp/nginx/scgi \
+		--http-uwsgi-temp-path=/var/tmp/nginx/uwsgi"
+
+
+    sed -i 's:.default::' ${WORKDIR}/nginx-${VERSION}/auto/install
+    sed -i -e '/koi-/d' -e '/win-/d' ${WORKDIR}/nginx-${VERSION}/auto/install
+
+    ./configure ${CONFIGURE}
+    make -j ${CPU_CORES} || return 1
+    return 0
+}
+
+nginx_install() {
+    cd ${WORKDIR}/nginx-${VERSION} || return 1
+    make install || return 1
+    user_add ${NGINX_USER}
+    return 0
+}
+
+nginx_default_config() {
+    cat << EOF > ${PREFIX}/nginx-${VERSION}/conf/nginx.conf
+user ${NGINX_USER} ${NGINX_USER};
+worker_processes ${CPU_CORES};
+error_log logs/error.log;
+
+events {
+    worker_connections 4096;
+	use epoll;
+}
+
+http {
+    include mime.types;
+    default_type application/octet-stream;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 60;
+    client_max_body_size 512M;
+
+    gzip on;
+    gzip_types text/plain;
+
+    server {
+        listen 80;
+        server_name $(hostname);
+
+        access_log logs/$(hostname)-access.log;
+        error_log logs/$(hostname)-error.log;
+
+        root /var/www/htdocs;
+        index index.php index.html;
+
+        include php.conf;
+    }
+
+}
+EOF
+    cat << EOF > ${PREFIX}/nginx-${VERSION}/conf/php.conf
+location ~ \\.php$ {
+    fastcgi_index   index.php;
+    fastcgi_pass    127.0.0.1:8833;
+    include         fastcgi_params;
+    include         fastcgi.conf;
+}
+EOF
+}
+
+nginx_post_install() {
+    if [ ${RUN} -ne 0 ]; then
+        wget -O rc.nginx 'http://wiki.nginx.org/index.php?title=RedHatNginxInitScript&action=raw&anchor=nginx'
+        cp -f ${WORKDIR}/nginx-${VERSION}/rc.nginx /etc/init.d/nginx
+        sed -i '/^nginx=/c\nginx=/usr/local/nginx/sbin/nginx' /etc/init.d/nginx
+        sed -i '/^NGINX_CONF_FILE=/c\NGINX_CONF_FILE=/usr/local/nginx/conf/nginx.conf' /etc/init.d/nginx
+
+        chmod 755 /etc/init.d/nginx
+        chkconfig --add /etc/init.d/nginx
+        chkconfig nginx on
+
+        mkdir -p /var/www/htdocs /var/tmp/nginx
+        echo "<?php print gethostname(); ?>" > /var/www/htdocs/index.php
+
+        if [ ${EXIST} -ne 0 ]; then
+            nginx_default_config
+        fi
+
+        [ -L ${PREFIX}/nginx ] && rm -f ${PREFIX}/nginx
+        ln -sf ${PREFIX}/nginx-${VERSION} ${PREFIX}/nginx
+
+        printf "starting nginx\n"
+        /etc/init.d/nginx start || return 1
+    else
+        printf "nginx is already running, skipping post-install\n"
     fi
     return 0
 }
@@ -667,7 +843,7 @@ lighttpd_post_install() {
 ##################
 
 OPTS="vh"
-LONGOPTS="mysql-version:,php-version:,lighttpd-version:,mysql-user:,php-user:,lighttpd-user:,help,version,mysql,mysql-fetch,mysql-compile,mysql-install,mysql-post-install,php,php-fetch,php-compile,php-install,php-post-install,lighttpd,lighttpd-fetch,lighttpd-compile,lighttpd-install,lighttpd-post-install"
+LONGOPTS="mysql-version:,php-version:,lighttpd-version:,nginx-version:,mysql-user:,php-user:,lighttpd-user:,nginx-user:,help,version,mysql,mysql-fetch,mysql-compile,mysql-install,mysql-post-install,php,php-fetch,php-compile,php-install,php-post-install,lighttpd,lighttpd-fetch,lighttpd-compile,lighttpd-install,lighttpd-post-install,nginx,nginx-fetch,nginx-compile,nginx-install,nginx-post-install"
 ARGS=`getopt --name ${PROGNAME} -o ${OPTS} -l ${LONGOPTS} -- "$@"`
 eval set -- "${ARGS}"
 
@@ -753,6 +929,33 @@ while true; do
     --lighttpd-post-install)
         lighttpd_prepare
         lighttpd_post_install
+        shift;;
+
+    --nginx)
+        nginx_prepare
+        nginx_fetch && nginx_compile && nginx_install && nginx_post_install && unset VERSION
+        shift;;
+    --nginx-version)
+        nginx_prepare "$2"
+        shift;;
+    --nginx-user)
+        NGINX_USER="$2"
+        shift;;
+    --nginx-fetch)
+        nginx_prepare
+        nginx_fetch
+        shift;;
+    --nginx-compile)
+        nginx_prepare
+        nginx_compile
+        shift;;
+    --nginx-install)
+        nginx_prepare
+        nginx_install
+        shift;;
+    --nginx-post-install)
+        nginx_prepare
+        nginx_post_install
         shift;;
 
     -h|--help)
